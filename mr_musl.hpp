@@ -199,8 +199,12 @@ namespace mr_musl
 {
   namespace math
   {
+    double sqrt(double x);
     double sin(double x);
     double cos(double x);
+    float sqrtf(float x);
+    float sinf(float x);
+    float cosf(float x);
   }
 }
 
@@ -227,6 +231,20 @@ static_assert(sizeof(double_t) == 8, "assuming double_t is double");
 #elif FLT_EVAL_METHOD==2
 #define EPS LDBL_EPSILON
 #endif
+
+#define M_E             2.7182818284590452354   /* e */
+#define M_LOG2E         1.4426950408889634074   /* log_2 e */
+#define M_LOG10E        0.43429448190325182765  /* log_10 e */
+#define M_LN2           0.69314718055994530942  /* log_e 2 */
+#define M_LN10          2.30258509299404568402  /* log_e 10 */
+#define M_PI            3.14159265358979323846  /* pi */
+#define M_PI_2          1.57079632679489661923  /* pi/2 */
+#define M_PI_4          0.78539816339744830962  /* pi/4 */
+#define M_1_PI          0.31830988618379067154  /* 1/pi */
+#define M_2_PI          0.63661977236758134308  /* 2/pi */
+#define M_2_SQRTPI      1.12837916709551257390  /* 2/sqrt(pi) */
+#define M_SQRT2         1.41421356237309504880  /* sqrt(2) */
+#define M_SQRT1_2       0.70710678118654752440  /* 1/sqrt(2) */
 
 // musl file begin: src/internal/libm.h
 /* Helps static branch prediction so hot path can be better optimized.  */
@@ -266,6 +284,22 @@ static inline void fp_force_evall(long double x)
   }                                         \
 } while(0)
 
+union asuint_helper
+{
+  float _f;
+  uint32_t _i;
+};
+
+#define asuint(f) ((asuint_helper){f})._i
+
+union asfloat_helper
+{
+  uint32_t _i;
+  float _f;
+};
+
+#define asfloat(i) ((asfloat_helper){i})._f
+
 union asuint64_helper
 {
   double _f;
@@ -274,11 +308,310 @@ union asuint64_helper
 
 #define asuint64(f) ((asuint64_helper){f})._i
 
+union asdouble_helper
+{
+  uint64_t _i;
+  double _f;
+};
+
+#define asdouble(i) ((asdouble_helper){i})._f
+
+#define EXTRACT_WORDS(hi,lo,d)                    \
+do {                                              \
+  uint64_t __u = asuint64(d);                     \
+  (hi) = __u >> 32;                               \
+  (lo) = (uint32_t)__u;                           \
+} while (0)
+
 #define GET_HIGH_WORD(hi,d)                       \
 do {                                              \
   (hi) = asuint64(d) >> 32;                       \
 } while (0)
+
+#define INSERT_WORDS(d,hi,lo)                     \
+do {                                              \
+  (d) = asdouble(((uint64_t)(hi)<<32) | (uint32_t)(lo)); \
+} while (0)
+
+#define GET_FLOAT_WORD(w,d)                       \
+do {                                              \
+  (w) = asuint(d);                                \
+} while (0)
+
+#define SET_FLOAT_WORD(d,w)                       \
+do {                                              \
+  (d) = asfloat(w);                               \
+} while (0)
 // musl file end: src/internal/libm.h
+
+// musl file begin: src/math/sqrt.c
+/* origin: FreeBSD /usr/src/lib/msun/src/e_sqrt.c */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunSoft, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+/* sqrt(x)
+ * Return correctly rounded sqrt.
+ *           ------------------------------------------
+ *           |  Use the hardware sqrt if you have one |
+ *           ------------------------------------------
+ * Method:
+ *   Bit by bit method using integer arithmetic. (Slow, but portable)
+ *   1. Normalization
+ *      Scale x to y in [1,4) with even powers of 2:
+ *      find an integer k such that  1 <= (y=x*2^(2k)) < 4, then
+ *              sqrt(x) = 2^k * sqrt(y)
+ *   2. Bit by bit computation
+ *      Let q  = sqrt(y) truncated to i bit after binary point (q = 1),
+ *           i                                                   0
+ *                                     i+1         2
+ *          s  = 2*q , and      y  =  2   * ( y - q  ).         (1)
+ *           i      i            i                 i
+ *
+ *      To compute q    from q , one checks whether
+ *                  i+1       i
+ *
+ *                            -(i+1) 2
+ *                      (q + 2      ) <= y.                     (2)
+ *                        i
+ *                                                            -(i+1)
+ *      If (2) is false, then q   = q ; otherwise q   = q  + 2      .
+ *                             i+1   i             i+1   i
+ *
+ *      With some algebric manipulation, it is not difficult to see
+ *      that (2) is equivalent to
+ *                             -(i+1)
+ *                      s  +  2       <= y                      (3)
+ *                       i                i
+ *
+ *      The advantage of (3) is that s  and y  can be computed by
+ *                                    i      i
+ *      the following recurrence formula:
+ *          if (3) is false
+ *
+ *          s     =  s  ,       y    = y   ;                    (4)
+ *           i+1      i          i+1    i
+ *
+ *          otherwise,
+ *                         -i                     -(i+1)
+ *          s     =  s  + 2  ,  y    = y  -  s  - 2             (5)
+ *           i+1      i          i+1    i     i
+ *
+ *      One may easily use induction to prove (4) and (5).
+ *      Note. Since the left hand side of (3) contain only i+2 bits,
+ *            it does not necessary to do a full (53-bit) comparison
+ *            in (3).
+ *   3. Final rounding
+ *      After generating the 53 bits result, we compute one more bit.
+ *      Together with the remainder, we can decide whether the
+ *      result is exact, bigger than 1/2ulp, or less than 1/2ulp
+ *      (it will never equal to 1/2ulp).
+ *      The rounding mode can be detected by checking whether
+ *      huge + tiny is equal to huge, and whether huge - tiny is
+ *      equal to huge for some floating point number "huge" and "tiny".
+ *
+ * Special cases:
+ *      sqrt(+-0) = +-0         ... exact
+ *      sqrt(inf) = inf
+ *      sqrt(-ve) = NaN         ... with invalid signal
+ *      sqrt(NaN) = NaN         ... with invalid signal for signaling NaN
+ */
+
+double mr_musl::math::sqrt(double x)
+{
+  static const double tiny = 1.0e-300;
+
+  double z;
+  int32_t sign = (int)0x80000000;
+  int32_t ix0,s0,q,m,t,i;
+  uint32_t r,t1,s1,ix1,q1;
+
+  EXTRACT_WORDS(ix0, ix1, x);
+
+  /* take care of Inf and NaN */
+  if ((ix0&0x7ff00000) == 0x7ff00000) {
+    return x*x + x;  /* sqrt(NaN)=NaN, sqrt(+inf)=+inf, sqrt(-inf)=sNaN */
+  }
+  /* take care of zero */
+  if (ix0 <= 0) {
+    if (((ix0&~sign)|ix1) == 0)
+      return x;  /* sqrt(+-0) = +-0 */
+    if (ix0 < 0)
+      return (x-x)/(x-x);  /* sqrt(-ve) = sNaN */
+  }
+  /* normalize x */
+  m = ix0>>20;
+  if (m == 0) {  /* subnormal x */
+    while (ix0 == 0) {
+      m -= 21;
+      ix0 |= (ix1>>11);
+      ix1 <<= 21;
+    }
+    for (i=0; (ix0&0x00100000) == 0; i++)
+      ix0<<=1;
+    m -= i - 1;
+    ix0 |= ix1>>(32-i);
+    ix1 <<= i;
+  }
+  m -= 1023;    /* unbias exponent */
+  ix0 = (ix0&0x000fffff)|0x00100000;
+  if (m & 1) {  /* odd m, double x to make it even */
+    ix0 += ix0 + ((ix1&sign)>>31);
+    ix1 += ix1;
+  }
+  m >>= 1;      /* m = [m/2] */
+
+  /* generate sqrt(x) bit by bit */
+  ix0 += ix0 + ((ix1&sign)>>31);
+  ix1 += ix1;
+  q = q1 = s0 = s1 = 0;  /* [q,q1] = sqrt(x) */
+  r = 0x00200000;        /* r = moving bit from right to left */
+
+  while (r != 0) {
+    t = s0 + r;
+    if (t <= ix0) {
+      s0   = t + r;
+      ix0 -= t;
+      q   += r;
+    }
+    ix0 += ix0 + ((ix1&sign)>>31);
+    ix1 += ix1;
+    r >>= 1;
+  }
+
+  r = sign;
+  while (r != 0) {
+    t1 = s1 + r;
+    t  = s0;
+    if (t < ix0 || (t == ix0 && t1 <= ix1)) {
+      s1 = t1 + r;
+      if ((t1&sign) == sign && (s1&sign) == 0)
+        s0++;
+      ix0 -= t;
+      if (ix1 < t1)
+        ix0--;
+      ix1 -= t1;
+      q1 += r;
+    }
+    ix0 += ix0 + ((ix1&sign)>>31);
+    ix1 += ix1;
+    r >>= 1;
+  }
+
+  /* use floating add to find out rounding direction */
+  if ((ix0|ix1) != 0) {
+    z = 1.0 - tiny; /* raise inexact flag */
+    if (z >= 1.0) {
+      z = 1.0 + tiny;
+      if (q1 == (uint32_t)0xffffffff) {
+        q1 = 0;
+        q++;
+      } else if (z > 1.0) {
+        if (q1 == (uint32_t)0xfffffffe)
+          q++;
+        q1 += 2;
+      } else
+        q1 += q1 & 1;
+    }
+  }
+  ix0 = (q>>1) + 0x3fe00000;
+  ix1 = q1>>1;
+  if (q&1)
+    ix1 |= sign;
+  INSERT_WORDS(z, ix0 + ((uint32_t)m << 20), ix1);
+  return z;
+}
+// musl file end: src/math/sqrt.c
+
+// musl file begin: src/math/sqrtf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/e_sqrtf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+float mr_musl::math::sqrtf(float x)
+{
+  static const float tiny = 1.0e-30;
+
+  float z;
+  int32_t sign = (int)0x80000000;
+  int32_t ix,s,q,m,t,i;
+  uint32_t r;
+
+  GET_FLOAT_WORD(ix, x);
+
+  /* take care of Inf and NaN */
+  if ((ix&0x7f800000) == 0x7f800000)
+    return x*x + x; /* sqrt(NaN)=NaN, sqrt(+inf)=+inf, sqrt(-inf)=sNaN */
+
+  /* take care of zero */
+  if (ix <= 0) {
+    if ((ix&~sign) == 0)
+      return x;  /* sqrt(+-0) = +-0 */
+    if (ix < 0)
+      return (x-x)/(x-x);  /* sqrt(-ve) = sNaN */
+  }
+  /* normalize x */
+  m = ix>>23;
+  if (m == 0) {  /* subnormal x */
+    for (i = 0; (ix&0x00800000) == 0; i++)
+      ix<<=1;
+    m -= i - 1;
+  }
+  m -= 127;  /* unbias exponent */
+  ix = (ix&0x007fffff)|0x00800000;
+  if (m&1)  /* odd m, double x to make it even */
+    ix += ix;
+  m >>= 1;  /* m = [m/2] */
+
+  /* generate sqrt(x) bit by bit */
+  ix += ix;
+  q = s = 0;       /* q = sqrt(x) */
+  r = 0x01000000;  /* r = moving bit from right to left */
+
+  while (r != 0) {
+    t = s + r;
+    if (t <= ix) {
+      s = t+r;
+      ix -= t;
+      q += r;
+    }
+    ix += ix;
+    r >>= 1;
+  }
+
+  /* use floating add to find out rounding direction */
+  if (ix != 0) {
+    z = 1.0f - tiny; /* raise inexact flag */
+    if (z >= 1.0f) {
+      z = 1.0f + tiny;
+      if (z > 1.0f)
+        q += 2;
+      else
+        q += q & 1;
+    }
+  }
+  ix = (q>>1) + 0x3f000000;
+  SET_FLOAT_WORD(z, ix + ((uint32_t)m << 23));
+  return z;
+}
+// musl file end: src/math/sqrtf.c
 
 // musl file begin: src/math/floor.c
 double floor(double x)
@@ -968,6 +1301,87 @@ medium:
 }
 // musl file end: src/math/__rem_pio2.c
 
+// musl file begin: src/math/__rem_pio2f.c
+/* origin: FreeBSD /usr/src/lib/msun/src/e_rem_pio2f.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Debugged and optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+/* __rem_pio2f(x,y)
+ *
+ * return the remainder of x rem pi/2 in *y
+ * use double precision for everything except passing x
+ * use __rem_pio2_large() for large x
+ */
+
+int __rem_pio2f(float x, double *y)
+{
+  /*
+   * invpio2:  53 bits of 2/pi
+   * pio2_1:   first 25 bits of pi/2
+   * pio2_1t:  pi/2 - pio2_1
+   */
+  static const double
+  toint   = 1.5/EPS,
+  pio4    = 0x1.921fb6p-1,
+  invpio2 = 6.36619772367581382433e-01, /* 0x3FE45F30, 0x6DC9C883 */
+  pio2_1  = 1.57079631090164184570e+00, /* 0x3FF921FB, 0x50000000 */
+  pio2_1t = 1.58932547735281966916e-08; /* 0x3E5110b4, 0x611A6263 */
+
+  union {float f; uint32_t i;} u = {x};
+  double tx[1],ty[1];
+  double_t fn;
+  uint32_t ix;
+  int n, sign, e0;
+
+  ix = u.i & 0x7fffffff;
+  /* 25+53 bit pi is good enough for medium size */
+  if (ix < 0x4dc90fdb) {  /* |x| ~< 2^28*(pi/2), medium size */
+    /* Use a specialized rint() to get fn. */
+    fn = (double_t)x*invpio2 + toint - toint;
+    n  = (int32_t)fn;
+    *y = x - fn*pio2_1 - fn*pio2_1t;
+    /* Matters with directed rounding. */
+    if (predict_false(*y < -pio4)) {
+      n--;
+      fn--;
+      *y = x - fn*pio2_1 - fn*pio2_1t;
+    } else if (predict_false(*y > pio4)) {
+      n++;
+      fn++;
+      *y = x - fn*pio2_1 - fn*pio2_1t;
+    }
+    return n;
+  }
+  if(ix>=0x7f800000) {  /* x is inf or NaN */
+    *y = x-x;
+    return 0;
+  }
+  /* scale x into [2^23, 2^24-1] */
+  sign = u.i>>31;
+  e0 = (ix>>23) - (0x7f+23);  /* e0 = ilogb(|x|)-23, positive */
+  u.i = ix - (e0<<23);
+  tx[0] = u.f;
+  n  =  __rem_pio2_large(tx,ty,e0,1,0);
+  if (sign) {
+    *y = -ty[0];
+    return -n;
+  }
+  *y = ty[0];
+  return n;
+}
+// musl file end: src/math/__rem_pio2f.c
+
 // musl file begin: src/math/__cos.c
 /* origin: FreeBSD /usr/src/lib/msun/src/k_cos.c */
 /*
@@ -1040,6 +1454,41 @@ double __cos(double x, double y)
 }
 // musl file end: src/math/__cos.c
 
+// musl file begin: src/math/__cosdf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/k_cosf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Debugged and optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+float __cosdf(double x)
+{
+  /* |cos(x) - c(x)| < 2**-34.1 (~[-5.37e-11, 5.295e-11]). */
+  static const double
+  C0  = -0x1ffffffd0c5e81.0p-54, /* -0.499999997251031003120 */
+  C1  =  0x155553e1053a42.0p-57, /*  0.0416666233237390631894 */
+  C2  = -0x16c087e80f1e27.0p-62, /* -0.00138867637746099294692 */
+  C3  =  0x199342e0ee5069.0p-68; /*  0.0000243904487962774090654 */
+  double_t r, w, z;
+
+  /* Try to optimize for parallel evaluation as in __tandf.c. */
+  z = x*x;
+  w = z*z;
+  r = C2+z*C3;
+  return ((1.0+z*C0) + w*C1) + (w*z)*r;
+}
+// musl file end: src/math/__cosdf.c
+
 // musl file begin: src/math/__sin.c
 /* origin: FreeBSD /usr/src/lib/msun/src/k_sin.c */
 /*
@@ -1104,6 +1553,43 @@ double __sin(double x, double y, int iy)
     return x - ((z*(0.5*y - v*r) - y) - v*S1);
 }
 // musl file end: src/math/__sin.c
+
+// musl file begin: src/math/__sindf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/k_sinf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+float __sindf(double x)
+{
+  /* |sin(x)/x - s(x)| < 2**-37.5 (~[-4.89e-12, 4.824e-12]). */
+  static const double
+  S1 = -0x15555554cbac77.0p-55, /* -0.166666666416265235595 */
+  S2 =  0x111110896efbb2.0p-59, /*  0.0083333293858894631756 */
+  S3 = -0x1a00f9e2cae774.0p-65, /* -0.000198393348360966317347 */
+  S4 =  0x16cd878c3b46a7.0p-71; /*  0.0000027183114939898219064 */
+
+  double_t r, s, w, z;
+
+  /* Try to optimize for parallel evaluation as in __tandf.c. */
+  z = x*x;
+  w = z*z;
+  r = S3 + z*S4;
+  s = z*x;
+  return (x + s*(S1 + z*S2)) + s*w*r;
+}
+// musl file end: src/math/__sindf.c
 
 // musl file begin: src/math/cos.c
 /* origin: FreeBSD /usr/src/lib/msun/src/s_cos.c */
@@ -1183,6 +1669,84 @@ double mr_musl::math::cos(double x)
 }
 // musl file end: src/math/cos.c
 
+// musl file begin: src/math/cosf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/s_cosf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+float mr_musl::math::cosf(float x)
+{
+  /* Small multiples of pi/2 rounded to double precision. */
+  static const double
+  c1pio2 = 1*M_PI_2, /* 0x3FF921FB, 0x54442D18 */
+  c2pio2 = 2*M_PI_2, /* 0x400921FB, 0x54442D18 */
+  c3pio2 = 3*M_PI_2, /* 0x4012D97C, 0x7F3321D2 */
+  c4pio2 = 4*M_PI_2; /* 0x401921FB, 0x54442D18 */
+  double y;
+  uint32_t ix;
+  unsigned n, sign;
+
+  GET_FLOAT_WORD(ix, x);
+  sign = ix >> 31;
+  ix &= 0x7fffffff;
+
+  if (ix <= 0x3f490fda) {  /* |x| ~<= pi/4 */
+    if (ix < 0x39800000) {  /* |x| < 2**-12 */
+      /* raise inexact if x != 0 */
+      FORCE_EVAL(x + 0x1p120f);
+      return 1.0f;
+    }
+    return __cosdf(x);
+  }
+  if (ix <= 0x407b53d1) {  /* |x| ~<= 5*pi/4 */
+    if (ix > 0x4016cbe3)  /* |x|  ~> 3*pi/4 */
+      return -__cosdf(sign ? x+c2pio2 : x-c2pio2);
+    else {
+      if (sign)
+        return __sindf(x + c1pio2);
+      else
+        return __sindf(c1pio2 - x);
+    }
+  }
+  if (ix <= 0x40e231d5) {  /* |x| ~<= 9*pi/4 */
+    if (ix > 0x40afeddf)  /* |x| ~> 7*pi/4 */
+      return __cosdf(sign ? x+c4pio2 : x-c4pio2);
+    else {
+      if (sign)
+        return __sindf(-x - c3pio2);
+      else
+        return __sindf(x - c3pio2);
+    }
+  }
+
+  /* cos(Inf or NaN) is NaN */
+  if (ix >= 0x7f800000)
+    return x-x;
+
+  /* general argument reduction needed */
+  n = __rem_pio2f(x,&y);
+  switch (n&3) {
+  case 0: return  __cosdf(y);
+  case 1: return  __sindf(-y);
+  case 2: return -__cosdf(y);
+  default:
+    return  __sindf(y);
+  }
+}
+// musl file end: src/math/cosf.c
+
 // musl file begin: src/math/sin.c
 /* origin: FreeBSD /usr/src/lib/msun/src/s_sin.c */
 /*
@@ -1261,5 +1825,82 @@ double mr_musl::math::sin(double x)
   }
 }
 // musl file end: src/math/sin.c
+
+// musl file begin: src/math/sinf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/s_sinf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+float mr_musl::math::sinf(float x)
+{
+  /* Small multiples of pi/2 rounded to double precision. */
+  static const double
+  s1pio2 = 1*M_PI_2, /* 0x3FF921FB, 0x54442D18 */
+  s2pio2 = 2*M_PI_2, /* 0x400921FB, 0x54442D18 */
+  s3pio2 = 3*M_PI_2, /* 0x4012D97C, 0x7F3321D2 */
+  s4pio2 = 4*M_PI_2; /* 0x401921FB, 0x54442D18 */
+
+  double y;
+  uint32_t ix;
+  int n, sign;
+
+  GET_FLOAT_WORD(ix, x);
+  sign = ix >> 31;
+  ix &= 0x7fffffff;
+
+  if (ix <= 0x3f490fda) {  /* |x| ~<= pi/4 */
+    if (ix < 0x39800000) {  /* |x| < 2**-12 */
+      /* raise inexact if x!=0 and underflow if subnormal */
+      FORCE_EVAL(ix < 0x00800000 ? x/0x1p120f : x+0x1p120f);
+      return x;
+    }
+    return __sindf(x);
+  }
+  if (ix <= 0x407b53d1) {  /* |x| ~<= 5*pi/4 */
+    if (ix <= 0x4016cbe3) {  /* |x| ~<= 3pi/4 */
+      if (sign)
+        return -__cosdf(x + s1pio2);
+      else
+        return __cosdf(x - s1pio2);
+    }
+    return __sindf(sign ? -(x + s2pio2) : -(x - s2pio2));
+  }
+  if (ix <= 0x40e231d5) {  /* |x| ~<= 9*pi/4 */
+    if (ix <= 0x40afeddf) {  /* |x| ~<= 7*pi/4 */
+      if (sign)
+        return __cosdf(x + s3pio2);
+      else
+        return -__cosdf(x - s3pio2);
+    }
+    return __sindf(sign ? x + s4pio2 : x - s4pio2);
+  }
+
+  /* sin(Inf or NaN) is NaN */
+  if (ix >= 0x7f800000)
+    return x - x;
+
+  /* general argument reduction needed */
+  n = __rem_pio2f(x, &y);
+  switch (n&3) {
+  case 0: return  __sindf(y);
+  case 1: return  __cosdf(y);
+  case 2: return  __sindf(-y);
+  default:
+    return -__cosdf(y);
+  }
+}
+// musl file end: src/math/sinf.c
 
 #endif // MR_MUSL_IMPLEMENTATION
