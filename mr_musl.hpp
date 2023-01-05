@@ -199,6 +199,11 @@ namespace mr_musl
 {
   namespace math
   {
+    float fabsf(float x);
+
+    float atanf(float x);
+    float atan2f(float x, float y);
+
     float cosf(float x);
     double cos(double x);
 
@@ -207,6 +212,8 @@ namespace mr_musl
 
     float sqrtf(float x);
     double sqrt(double x);
+
+    float cbrtf(float x);
 
     float powf(float x, float y);
   }
@@ -225,6 +232,9 @@ static_assert(sizeof(uint32_t) == 4, "assuming uint32_t is unsigned int");
 typedef unsigned long long uint64_t;
 static_assert(sizeof(uint64_t) == 8, "assuming uint64_t is unsigned long long");
 
+typedef double float_t;
+static_assert(sizeof(float_t) == 8, "assuming float_t is float");
+
 typedef double double_t;
 static_assert(sizeof(double_t) == 8, "assuming double_t is double");
 
@@ -235,6 +245,52 @@ static_assert(sizeof(double_t) == 8, "assuming double_t is double");
 #elif FLT_EVAL_METHOD==2
 #define EPS LDBL_EPSILON
 #endif
+
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+
+int __fpclassify(double x)
+{
+  union {double f; uint64_t i;} u = {x};
+  int e = u.i>>52 & 0x7ff;
+  if (!e) return u.i<<1 ? FP_SUBNORMAL : FP_ZERO;
+  if (e==0x7ff) return u.i<<12 ? FP_NAN : FP_INFINITE;
+  return FP_NORMAL;
+}
+
+int __fpclassifyf(float x)
+{
+  union {float f; uint32_t i;} u = {x};
+  int e = u.i>>23 & 0xff;
+  if (!e) return u.i<<1 ? FP_SUBNORMAL : FP_ZERO;
+  if (e==0xff) return u.i<<9 ? FP_NAN : FP_INFINITE;
+  return FP_NORMAL;
+}
+
+// FIXME: Non-portable! Works on MSVC and compatibles only!
+static_assert(sizeof(long double) == 8, "assuming long double is double");
+#define __fpclassifyl(ld) __fpclassify(ld)
+
+static __inline unsigned __FLOAT_BITS(float __f)
+{
+  union {float __f; unsigned __i;} __u;
+  __u.__f = __f;
+  return __u.__i;
+}
+static __inline unsigned long long __DOUBLE_BITS(double __f)
+{
+  union {double __f; unsigned long long __i;} __u;
+  __u.__f = __f;
+  return __u.__i;
+}
+
+#define isnan(x) ( \
+  sizeof(x) == sizeof(float) ? (__FLOAT_BITS(x) & 0x7fffffff) > 0x7f800000 : \
+  sizeof(x) == sizeof(double) ? (__DOUBLE_BITS(x) & -1ULL>>1) > 0x7ffULL<<52 : \
+  __fpclassifyl(x) == FP_NAN)
 
 #define M_E             2.7182818284590452354   /* e */
 #define M_LOG2E         1.4426950408889634074   /* log_2 e */
@@ -2121,9 +2177,6 @@ const struct powf_log2_data __powf_log2_data = {
  * SPDX-License-Identifier: MIT
  */
 
-// #include <math.h>
-// #include <stdint.h>
-
 /*
 POWF_LOG2_POLY_ORDER = 5
 EXP2F_TABLE_BITS = 5
@@ -2262,7 +2315,7 @@ float mr_musl::math::powf(float x, float y)
       return y * y;
     }
     if (predict_false(zeroinfnan(ix))) {
-      float x2 = x * x;
+      float_t x2 = x * x;
       if (ix & 0x80000000 && checkint(iy) == 1)
         x2 = -x2;
       /* Without the barrier some versions of clang hoist the 1/x2 and
@@ -2304,5 +2357,259 @@ float mr_musl::math::powf(float x, float y)
 #undef A
 #undef OFF
 // musl file end: src/math/powf.c
+
+// musl file begin: src/math/cbrtf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/s_cbrtf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ * Debugged and optimized by Bruce D. Evans.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+/* cbrtf(x)
+ * Return cube root of x
+ */
+
+
+static const unsigned
+B1 = 709958130, /* B1 = (127-127.0/3-0.03306235651)*2**23 */
+B2 = 642849266; /* B2 = (127-127.0/3-24/3-0.03306235651)*2**23 */
+
+float mr_musl::math::cbrtf(float x)
+{
+  double_t r,T;
+  union {float f; uint32_t i;} u = {x};
+  uint32_t hx = u.i & 0x7fffffff;
+
+  if (hx >= 0x7f800000)  /* cbrt(NaN,INF) is itself */
+    return x + x;
+
+  /* rough cbrt to 5 bits */
+  if (hx < 0x00800000) {  /* zero or subnormal? */
+    if (hx == 0)
+      return x;  /* cbrt(+-0) is itself */
+    u.f = x*0x1p24f;
+    hx = u.i & 0x7fffffff;
+    hx = hx/3 + B2;
+  } else
+    hx = hx/3 + B1;
+  u.i &= 0x80000000;
+  u.i |= hx;
+
+  /*
+   * First step Newton iteration (solving t*t-x/t == 0) to 16 bits.  In
+   * double precision so that its terms can be arranged for efficiency
+   * without causing overflow or underflow.
+   */
+  T = u.f;
+  r = T*T*T;
+  T = T*((double_t)x+x+r)/(x+r+r);
+
+  /*
+   * Second step Newton iteration to 47 bits.  In double precision for
+   * efficiency and accuracy.
+   */
+  r = T*T*T;
+  T = T*((double_t)x+x+r)/(x+r+r);
+
+  /* rounding to 24 bits is perfect in round-to-nearest mode */
+  return T;
+}
+// musl file end: src/math/cbrtf.c
+
+// musl file begin: src/math/fabsf.c
+float mr_musl::math::fabsf(float x)
+{
+  union {float f; uint32_t i;} u = {x};
+  u.i &= 0x7fffffff;
+  return u.f;
+}
+// musl file end: src/math/fabsf.c
+
+// musl file begin: src/math/atanf.c
+/* origin: FreeBSD /usr/src/lib/msun/src/s_atanf.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+static const float atanhi[] = {
+  4.6364760399e-01, /* atan(0.5)hi 0x3eed6338 */
+  7.8539812565e-01, /* atan(1.0)hi 0x3f490fda */
+  9.8279368877e-01, /* atan(1.5)hi 0x3f7b985e */
+  1.5707962513e+00, /* atan(inf)hi 0x3fc90fda */
+};
+
+static const float atanlo[] = {
+  5.0121582440e-09, /* atan(0.5)lo 0x31ac3769 */
+  3.7748947079e-08, /* atan(1.0)lo 0x33222168 */
+  3.4473217170e-08, /* atan(1.5)lo 0x33140fb4 */
+  7.5497894159e-08, /* atan(inf)lo 0x33a22168 */
+};
+
+static const float aT[] = {
+  3.3333328366e-01,
+ -1.9999158382e-01,
+  1.4253635705e-01,
+ -1.0648017377e-01,
+  6.1687607318e-02,
+};
+
+float mr_musl::math::atanf(float x)
+{
+  float_t w,s1,s2,z;
+  uint32_t ix,sign;
+  int id;
+
+  GET_FLOAT_WORD(ix, x);
+  sign = ix>>31;
+  ix &= 0x7fffffff;
+  if (ix >= 0x4c800000) {  /* if |x| >= 2**26 */
+    if (isnan(x))
+      return x;
+    z = atanhi[3] + 0x1p-120f;
+    return sign ? -z : z;
+  }
+  if (ix < 0x3ee00000) {   /* |x| < 0.4375 */
+    if (ix < 0x39800000) {  /* |x| < 2**-12 */
+      if (ix < 0x00800000)
+        /* raise underflow for subnormal x */
+        FORCE_EVAL(x*x);
+      return x;
+    }
+    id = -1;
+  } else {
+    x = fabsf(x);
+    if (ix < 0x3f980000) {  /* |x| < 1.1875 */
+      if (ix < 0x3f300000) {  /*  7/16 <= |x| < 11/16 */
+        id = 0;
+        x = (2.0f*x - 1.0f)/(2.0f + x);
+      } else {                /* 11/16 <= |x| < 19/16 */
+        id = 1;
+        x = (x - 1.0f)/(x + 1.0f);
+      }
+    } else {
+      if (ix < 0x401c0000) {  /* |x| < 2.4375 */
+        id = 2;
+        x = (x - 1.5f)/(1.0f + 1.5f*x);
+      } else {                /* 2.4375 <= |x| < 2**26 */
+        id = 3;
+        x = -1.0f/x;
+      }
+    }
+  }
+  /* end of argument reduction */
+  z = x*x;
+  w = z*z;
+  /* break sum from i=0 to 10 aT[i]z**(i+1) into odd and even poly */
+  s1 = z*(aT[0]+w*(aT[2]+w*aT[4]));
+  s2 = w*(aT[1]+w*aT[3]);
+  if (id < 0)
+    return x - x*(s1+s2);
+  z = atanhi[id] - ((x*(s1+s2) - atanlo[id]) - x);
+  return sign ? -z : z;
+}
+// musl file end: src/math/atanf.c
+
+// musl file begin: src/math/atan2f.c
+/* origin: FreeBSD /usr/src/lib/msun/src/e_atan2f.c */
+/*
+ * Conversion to float by Ian Lance Taylor, Cygnus Support, ian@cygnus.com.
+ */
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+static const float
+pi     = 3.1415927410e+00, /* 0x40490fdb */
+pi_lo  = -8.7422776573e-08; /* 0xb3bbbd2e */
+
+float mr_musl::math::atan2f(float y, float x)
+{
+  float z;
+  uint32_t m,ix,iy;
+
+  if (isnan(x) || isnan(y))
+    return x+y;
+  GET_FLOAT_WORD(ix, x);
+  GET_FLOAT_WORD(iy, y);
+  if (ix == 0x3f800000)  /* x=1.0 */
+    return atanf(y);
+  m = ((iy>>31)&1) | ((ix>>30)&2);  /* 2*sign(x)+sign(y) */
+  ix &= 0x7fffffff;
+  iy &= 0x7fffffff;
+
+  /* when y = 0 */
+  if (iy == 0) {
+    switch (m) {
+    case 0:
+    case 1: return y;   /* atan(+-0,+anything)=+-0 */
+    case 2: return  pi; /* atan(+0,-anything) = pi */
+    case 3: return -pi; /* atan(-0,-anything) =-pi */
+    }
+  }
+  /* when x = 0 */
+  if (ix == 0)
+    return m&1 ? -pi/2 : pi/2;
+  /* when x is INF */
+  if (ix == 0x7f800000) {
+    if (iy == 0x7f800000) {
+      switch (m) {
+      case 0: return  pi/4; /* atan(+INF,+INF) */
+      case 1: return -pi/4; /* atan(-INF,+INF) */
+      case 2: return 3*pi/4;  /*atan(+INF,-INF)*/
+      case 3: return -3*pi/4; /*atan(-INF,-INF)*/
+      }
+    } else {
+      switch (m) {
+      case 0: return  0.0f;    /* atan(+...,+INF) */
+      case 1: return -0.0f;    /* atan(-...,+INF) */
+      case 2: return  pi; /* atan(+...,-INF) */
+      case 3: return -pi; /* atan(-...,-INF) */
+      }
+    }
+  }
+  /* |y/x| > 0x1p26 */
+  if (ix+(26<<23) < iy || iy == 0x7f800000)
+    return m&1 ? -pi/2 : pi/2;
+
+  /* z = atan(|y/x|) with correct underflow */
+  if ((m&2) && iy+(26<<23) < ix)  /*|y/x| < 0x1p-26, x < 0 */
+    z = 0.0;
+  else
+    z = atanf(fabsf(y/x));
+  switch (m) {
+  case 0: return z;              /* atan(+,+) */
+  case 1: return -z;             /* atan(-,+) */
+  case 2: return pi - (z-pi_lo); /* atan(+,-) */
+  default: /* case 3 */
+    return (z-pi_lo) - pi; /* atan(-,-) */
+  }
+}
+// musl file end: src/math/atan2f.c
 
 #endif // MR_MUSL_IMPLEMENTATION
